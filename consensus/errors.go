@@ -1,39 +1,37 @@
+// Copyright 2017 The life-file Authors
+// This file is part of the life-file library.
+//
+// The life-file library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The life-file library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the life-file library. If not, see <http://www.gnu.org/licenses/>.
+
 package consensus
 
-import (
-	"errors"
-)
+import "errors"
 
 var (
-	errFutureBlock   = errors.New("block in the future")
-	errParentMissing = errors.New("parent block is missing")
-	errKnownBlock    = errors.New("block already in the chain")
+	// ErrUnknownAncestor is returned when validating a block requires an ancestor
+	// that is unknown.
+	ErrUnknownAncestor = errors.New("unknown ancestor")
+
+	// ErrPrunedAncestor is returned when validating a block requires an ancestor
+	// that is known, but the state of which is not available.
+	ErrPrunedAncestor = errors.New("pruned ancestor")
+
+	// ErrFutureBlock is returned when a block's timestamp is in the future according
+	// to the current node.
+	ErrFutureBlock = errors.New("block in the future")
+
+	// ErrInvalidNumber is returned if a block's number doesn't equal its parent's
+	// plus one.
+	ErrInvalidNumber = errors.New("invalid block number")
 )
-
-type consensusError string
-
-func (err consensusError) Error() string {
-	return string(err)
-}
-
-// IsFutureBlock returns if the error indicates that the block should be
-// processed later.
-func IsFutureBlock(err error) bool {
-	return err == errFutureBlock
-}
-
-// IsParentMissing ...
-func IsParentMissing(err error) bool {
-	return err == errParentMissing
-}
-
-// IsKnownBlock returns if the error means the block was already in the chain.
-func IsKnownBlock(err error) bool {
-	return err == errKnownBlock
-}
-
-// IsCritical returns if the error is consensus related.
-func IsCritical(err error) bool {
-	_, ok := err.(consensusError)
-	return ok
-}

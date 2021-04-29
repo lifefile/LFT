@@ -1,23 +1,25 @@
-// Copyright 2014 The go-ethereum Authors
-// This file is part of the go-ethereum library.
+// Copyright 2014 The life-file Authors
+// This file is part of the life-file library.
 //
-// The go-ethereum library is free software: you can redistribute it and/or modify
+// The life-file library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The go-ethereum library is distributed in the hope that it will be useful,
+// The life-file library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// along with the life-file library. If not, see <http://www.gnu.org/licenses/>.
 
 package trie
 
 import (
 	"bytes"
+	"encoding/hex"
+	"math/rand"
 	"testing"
 )
 
@@ -71,6 +73,40 @@ func TestHexKeybytes(t *testing.T) {
 		}
 		if k := hexToKeybytes(test.hexIn); !bytes.Equal(k, test.key) {
 			t.Errorf("hexToKeybytes(%x) -> %x, want %x", test.hexIn, k, test.key)
+		}
+	}
+}
+
+func TestHexToCompactInPlace(t *testing.T) {
+	for i, keyS := range []string{
+		"00",
+		"060a040c0f000a090b040803010801010900080d090a0a0d0903000b10",
+		"10",
+	} {
+		hexBytes, _ := hex.DecodeString(keyS)
+		exp := hexToCompact(hexBytes)
+		sz := hexToCompactInPlace(hexBytes)
+		got := hexBytes[:sz]
+		if !bytes.Equal(exp, got) {
+			t.Fatalf("test %d: encoding err\ninp %v\ngot %x\nexp %x\n", i, keyS, got, exp)
+		}
+	}
+}
+
+func TestHexToCompactInPlaceRandom(t *testing.T) {
+	for i := 0; i < 10000; i++ {
+		l := rand.Intn(128)
+		key := make([]byte, l)
+		rand.Read(key)
+		hexBytes := keybytesToHex(key)
+		hexOrig := []byte(string(hexBytes))
+		exp := hexToCompact(hexBytes)
+		sz := hexToCompactInPlace(hexBytes)
+		got := hexBytes[:sz]
+
+		if !bytes.Equal(exp, got) {
+			t.Fatalf("encoding err \ncpt %x\nhex %x\ngot %x\nexp %x\n",
+				key, hexOrig, got, exp)
 		}
 	}
 }

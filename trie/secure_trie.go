@@ -1,31 +1,30 @@
-// Copyright 2015 The go-ethereum Authors
-// This file is part of the go-ethereum library.
+// Copyright 2015 The life-file Authors
+// This file is part of the life-file library.
 //
-// The go-ethereum library is free software: you can redistribute it and/or modify
+// The life-file library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The go-ethereum library is distributed in the hope that it will be useful,
+// The life-file library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// along with the life-file library. If not, see <http://www.gnu.org/licenses/>.
 
 package trie
 
 import (
 	"fmt"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
-	"github.com/lifefile/LFT/thor"
+	"github.com/lifefile/LFT/common"
+	"github.com/lifefile/LFT/log"
 )
 
 // SecureTrie wraps a trie with key hashing. In a secure trie, all
-// access operations hash the key using blake2b-256. This prevents
+// access operations hash the key using keccak256. This prevents
 // calling code from creating long chains of nodes that
 // increase the access time.
 //
@@ -41,20 +40,21 @@ type SecureTrie struct {
 	secKeyCacheOwner *SecureTrie // Pointer to self, replace the key cache on mismatch
 }
 
-// NewSecure creates a trie with an existing root node from db.
+// NewSecure creates a trie with an existing root node from a backing database
+// and optional intermediate in-memory node pool.
 //
-// If root is the zero hash or the blake2b-256 hash of an empty string, the
+// If root is the zero hash or the sha3 hash of an empty string, the
 // trie is initially empty. Otherwise, New will panic if db is nil
 // and returns MissingNodeError if the root node cannot be found.
 //
-// Accessing the trie loads nodes from db on demand.
+// Accessing the trie loads nodes from the database or node pool on demand.
 // Loaded nodes are kept around until their 'cache generation' expires.
 // A new cache generation is created by each call to Commit.
-func NewSecure(root thor.Bytes32, db Database) (*SecureTrie, error) {
+// cachelimit sets the number of past cache generations to keep.
+func NewSecure(root common.Hash, db *Database) (*SecureTrie, error) {
 	if db == nil {
-		panic("NewSecure called with nil database")
+		panic("trie.NewSecure called without a database")
 	}
-
 	trie, err := New(root, db)
 	if err != nil {
 		return nil, err
@@ -77,6 +77,12 @@ func (t *SecureTrie) Get(key []byte) []byte {
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *SecureTrie) TryGet(key []byte) ([]byte, error) {
 	return t.trie.TryGet(t.hashKey(key))
+}
+
+// TryGetNode attempts to retrieve a trie node by compact-encoded path. It is not
+// possible to use keybyte-encoding as the path might contain odd nibbles.
+func (t *SecureTrie) TryGetNode(path []byte) ([]byte, int, error) {
+	return t.trie.TryGetNode(path)
 }
 
 // Update associates key with value in the trie. Subsequent calls to
@@ -120,6 +126,7 @@ func (t *SecureTrie) Delete(key []byte) {
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *SecureTrie) TryDelete(key []byte) error {
 	hk := t.hashKey(key)
+	delete(t.getSecKeyCache(), string(hk))
 	return t.trie.TryDelete(hk)
 }
 
@@ -129,27 +136,37 @@ func (t *SecureTrie) GetKey(shaKey []byte) []byte {
 	if key, ok := t.getSecKeyCache()[string(shaKey)]; ok {
 		return key
 	}
-	key, _ := t.trie.db.Get(shaKey)
-	return key
+	return t.trie.db.preimage(common.BytesToHash(shaKey))
 }
 
 // Commit writes all nodes and the secure hash pre-images to the trie's database.
-// Nodes are stored with their blake2b hash as the key.
+// Nodes are stored with their sha3 hash as the key.
 //
 // Committing flushes nodes from memory. Subsequent Get calls will load nodes
 // from the database.
-func (t *SecureTrie) Commit() (root thor.Bytes32, err error) {
-	return t.CommitTo(t.trie.db)
+func (t *SecureTrie) Commit(onleaf LeafCallback) (root common.Hash, err error) {
+	// Write all the pre-images to the actual disk database
+	if len(t.getSecKeyCache()) > 0 {
+		if t.trie.db.preimages != nil { // Ugly direct check but avoids the below write lock
+			t.trie.db.lock.Lock()
+			for hk, key := range t.secKeyCache {
+				t.trie.db.insertPreimage(common.BytesToHash([]byte(hk)), key)
+			}
+			t.trie.db.lock.Unlock()
+		}
+		t.secKeyCache = make(map[string][]byte)
+	}
+	// Commit the trie to its intermediate node database
+	return t.trie.Commit(onleaf)
 }
 
-func (t *SecureTrie) Hash() thor.Bytes32 {
+// Hash returns the root hash of SecureTrie. It does not write to the
+// database and can be used even if the trie doesn't have one.
+func (t *SecureTrie) Hash() common.Hash {
 	return t.trie.Hash()
 }
 
-func (t *SecureTrie) Root() []byte {
-	return t.trie.Root()
-}
-
+// Copy returns a copy of SecureTrie.
 func (t *SecureTrie) Copy() *SecureTrie {
 	cpy := *t
 	return &cpy
@@ -161,33 +178,16 @@ func (t *SecureTrie) NodeIterator(start []byte) NodeIterator {
 	return t.trie.NodeIterator(start)
 }
 
-// CommitTo writes all nodes and the secure hash pre-images to the given database.
-// Nodes are stored with their blake2b hash as the key.
-//
-// Committing flushes nodes from memory. Subsequent Get calls will load nodes from
-// the trie's database. Calling code must ensure that the changes made to db are
-// written back to the trie's attached database before using the trie.
-func (t *SecureTrie) CommitTo(db DatabaseWriter) (root thor.Bytes32, err error) {
-	// Write all the pre-images to the actual disk database
-	if len(t.getSecKeyCache()) > 0 {
-		for hk, key := range t.secKeyCache {
-			db.Put([]byte(hk), key)
-		}
-		t.secKeyCache = make(map[string][]byte)
-	}
-	return t.trie.CommitTo(db)
-}
-
 // hashKey returns the hash of key as an ephemeral buffer.
 // The caller must not hold onto the return value because it will become
 // invalid on the next call to hashKey or secKey.
 func (t *SecureTrie) hashKey(key []byte) []byte {
-	h := newHasher()
+	h := newHasher(false)
 	h.sha.Reset()
 	h.sha.Write(key)
-	buf := h.sha.Sum(t.hashKeyBuf[:0])
+	h.sha.Read(t.hashKeyBuf[:])
 	returnHasherToPool(h)
-	return buf
+	return t.hashKeyBuf[:]
 }
 
 // getSecKeyCache returns the current secure key cache, creating a new one if

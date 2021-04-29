@@ -1,121 +1,127 @@
+// Copyright 2017 The life-file Authors
+// This file is part of the life-file library.
+//
+// The life-file library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The life-file library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the life-file library. If not, see <http://www.gnu.org/licenses/>.
+
+// Package consensus implements different LifeFile consensus engines.
 package consensus
 
 import (
-	"fmt"
+	"math/big"
 
-	"github.com/hashicorp/golang-lru/simplelru"
-	"github.com/lifefile/LFT/block"
-	"github.com/lifefile/LFT/builtin"
-	"github.com/lifefile/LFT/chain"
-
-	"github.com/lifefile/LFT/runtime"
-	"github.com/lifefile/LFT/state"
-	"github.com/lifefile/LFT/thor"
-	"github.com/lifefile/LFT/tx"
-	"github.com/lifefile/LFT/xenv"
+	"github.com/lifefile/LFT/common"
+	"github.com/lifefile/LFT/core/state"
+	"github.com/lifefile/LFT/core/types"
+	"github.com/lifefile/LFT/params"
+	"github.com/lifefile/LFT/rpc"
 )
 
-// Consensus check whether the block is verified,
-// and predicate which trunk it belong to.
-type Consensus struct {
-	repo                 *chain.Repository
-	stater               *state.Stater
-	forkConfig           thor.ForkConfig
-	correctReceiptsRoots map[string]string
-	candidatesCache      *simplelru.LRU
+// ChainHeaderReader defines a small collection of methods needed to access the local
+// blockchain during header verification.
+type ChainHeaderReader interface {
+	// Config retrieves the blockchain's chain configuration.
+	Config() *params.ChainConfig
+
+	// CurrentHeader retrieves the current header from the local chain.
+	CurrentHeader() *types.Header
+
+	// GetHeader retrieves a block header from the database by hash and number.
+	GetHeader(hash common.Hash, number uint64) *types.Header
+
+	// GetHeaderByNumber retrieves a block header from the database by number.
+	GetHeaderByNumber(number uint64) *types.Header
+
+	// GetHeaderByHash retrieves a block header from the database by its hash.
+	GetHeaderByHash(hash common.Hash) *types.Header
 }
 
-// New create a Consensus instance.
-func New(repo *chain.Repository, stater *state.Stater, forkConfig thor.ForkConfig) *Consensus {
-	candidatesCache, _ := simplelru.NewLRU(16, nil)
-	return &Consensus{
-		repo:                 repo,
-		stater:               stater,
-		forkConfig:           forkConfig,
-		correctReceiptsRoots: thor.LoadCorrectReceiptsRoots(),
-		candidatesCache:      candidatesCache,
-	}
+// ChainReader defines a small collection of methods needed to access the local
+// blockchain during header and/or uncle verification.
+type ChainReader interface {
+	ChainHeaderReader
+
+	// GetBlock retrieves a block from the database by hash and number.
+	GetBlock(hash common.Hash, number uint64) *types.Block
 }
 
-// Process process a block.
-func (c *Consensus) Process(blk *block.Block, nowTimestamp uint64) (*state.Stage, tx.Receipts, error) {
-	header := blk.Header()
+// Engine is an algorithm agnostic consensus engine.
+type Engine interface {
+	// Author retrieves the LifeFile address of the account that minted the given
+	// block, which may be different from the header's coinbase if a consensus
+	// engine is based on signatures.
+	Author(header *types.Header) (common.Address, error)
 
-	if _, err := c.repo.GetBlockSummary(header.ID()); err != nil {
-		if !c.repo.IsNotFound(err) {
-			return nil, nil, err
-		}
-	} else {
-		return nil, nil, errKnownBlock
-	}
+	// VerifyHeader checks whether a header conforms to the consensus rules of a
+	// given engine. Verifying the seal may be done optionally here, or explicitly
+	// via the VerifySeal method.
+	VerifyHeader(chain ChainHeaderReader, header *types.Header, seal bool) error
 
-	parentSummary, err := c.repo.GetBlockSummary(header.ParentID())
-	if err != nil {
-		if !c.repo.IsNotFound(err) {
-			return nil, nil, err
-		}
-		return nil, nil, errParentMissing
-	}
+	// VerifyHeaders is similar to VerifyHeader, but verifies a batch of headers
+	// concurrently. The method returns a quit channel to abort the operations and
+	// a results channel to retrieve the async verifications (the order is that of
+	// the input slice).
+	VerifyHeaders(chain ChainHeaderReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error)
 
-	state := c.stater.NewState(parentSummary.Header.StateRoot())
+	// VerifyUncles verifies that the given block's uncles conform to the consensus
+	// rules of a given engine.
+	VerifyUncles(chain ChainReader, block *types.Block) error
 
-	vip191 := c.forkConfig.VIP191
-	if vip191 == 0 {
-		vip191 = 1
-	}
-	// Before process hook of VIP-191, update builtin extension contract's code to V2
-	if header.Number() == vip191 {
-		if err := state.SetCode(builtin.Extension.Address, builtin.Extension.V2.RuntimeBytecodes()); err != nil {
-			return nil, nil, err
-		}
-	}
+	// Prepare initializes the consensus fields of a block header according to the
+	// rules of a particular engine. The changes are executed inline.
+	Prepare(chain ChainHeaderReader, header *types.Header) error
 
-	var features tx.Features
-	if header.Number() >= vip191 {
-		features |= tx.DelegationFeature
-	}
+	// Finalize runs any post-transaction state modifications (e.g. block rewards)
+	// but does not assemble the block.
+	//
+	// Note: The block header and state database might be updated to reflect any
+	// consensus rules that happen at finalization (e.g. block rewards).
+	Finalize(chain ChainHeaderReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
+		uncles []*types.Header)
 
-	if header.TxsFeatures() != features {
-		return nil, nil, consensusError(fmt.Sprintf("block txs features invalid: want %v, have %v", features, header.TxsFeatures()))
-	}
+	// FinalizeAndAssemble runs any post-transaction state modifications (e.g. block
+	// rewards) and assembles the final block.
+	//
+	// Note: The block header and state database might be updated to reflect any
+	// consensus rules that happen at finalization (e.g. block rewards).
+	FinalizeAndAssemble(chain ChainHeaderReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
+		uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error)
 
-	stage, receipts, err := c.validate(state, blk, parentSummary.Header, nowTimestamp)
-	if err != nil {
-		return nil, nil, err
-	}
+	// Seal generates a new sealing request for the given input block and pushes
+	// the result into the given channel.
+	//
+	// Note, the method returns immediately and will send the result async. More
+	// than one result may also be returned depending on the consensus algorithm.
+	Seal(chain ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error
 
-	return stage, receipts, nil
+	// SealHash returns the hash of a block prior to it being sealed.
+	SealHash(header *types.Header) common.Hash
+
+	// CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
+	// that a new block should have.
+	CalcDifficulty(chain ChainHeaderReader, time uint64, parent *types.Header) *big.Int
+
+	// APIs returns the RPC APIs this consensus engine provides.
+	APIs(chain ChainHeaderReader) []rpc.API
+
+	// Close terminates any background threads maintained by the consensus engine.
+	Close() error
 }
 
-func (c *Consensus) NewRuntimeForReplay(header *block.Header, skipPoA bool) (*runtime.Runtime, error) {
-	signer, err := header.Signer()
-	if err != nil {
-		return nil, err
-	}
-	parentSummary, err := c.repo.GetBlockSummary(header.ParentID())
-	if err != nil {
-		if !c.repo.IsNotFound(err) {
-			return nil, err
-		}
-		return nil, errParentMissing
-	}
-	state := c.stater.NewState(parentSummary.Header.StateRoot())
-	if !skipPoA {
-		if _, err := c.validateProposer(header, parentSummary.Header, state); err != nil {
-			return nil, err
-		}
-	}
+// PoW is a consensus engine based on proof-of-work.
+type PoW interface {
+	Engine
 
-	return runtime.New(
-		c.repo.NewChain(header.ParentID()),
-		state,
-		&xenv.BlockContext{
-			Beneficiary: header.Beneficiary(),
-			Signer:      signer,
-			Number:      header.Number(),
-			Time:        header.Timestamp(),
-			GasLimit:    header.GasLimit(),
-			TotalScore:  header.TotalScore(),
-		},
-		c.forkConfig), nil
+	// Hashrate returns the current mining hashrate of a PoW consensus engine.
+	Hashrate() float64
 }
